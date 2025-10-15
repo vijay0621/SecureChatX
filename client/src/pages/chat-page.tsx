@@ -207,6 +207,41 @@ export default function ChatPage() {
     decryptedText: decryptedMessages[msg.id] || msg.encryptedContent,
   }));
 
+  // Load full history when a contact is selected (ensures offline-sent messages appear)
+  useEffect(() => {
+    if (!selectedContactId) return;
+    (async () => {
+      try {
+        const res = await fetch(`/api/messages/${selectedContactId}`, {
+          headers: { 'x-user-id': auth.user.id },
+        });
+        if (!res.ok) return;
+        const remoteMessages: Message[] = await res.json();
+        setMessages(prev => {
+          const prevList = prev[selectedContactId] || [];
+          const merged = new Map<string, Message>();
+          for (const m of [...prevList, ...remoteMessages]) {
+            merged.set(m.id, m);
+          }
+          const list = Array.from(merged.values()).sort((a, b) => a.timestamp - b.timestamp);
+          return { ...prev, [selectedContactId]: list };
+        });
+        // Decrypt fetched messages
+        const decPairs = await Promise.all(remoteMessages.map(async (m) => {
+          const peerId = m.senderId === auth.user.id ? m.receiverId : m.senderId;
+          if (!m.encryptedAESKey) return [m.id, m.encryptedContent] as const;
+          const text = await decryptMessage(m.encryptedContent, m.iv, m.hmac, m.encryptedAESKey, peerId);
+          return [m.id, text || m.encryptedContent] as const;
+        }));
+        const decUpdates: { [k: string]: string } = {};
+        for (const [id, text] of decPairs) decUpdates[id] = text;
+        setDecryptedMessages(prev => ({ ...prev, ...decUpdates }));
+      } catch {
+        // ignore fetch failures silently
+      }
+    })();
+  }, [selectedContactId, auth.user.id]);
+
   const handleSelectContact = (contactId: string) => {
     setSelectedContactId(contactId);
     setShowSecurityPanel(false);
