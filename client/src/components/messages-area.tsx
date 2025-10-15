@@ -37,6 +37,7 @@ export function MessagesArea({ messages, currentUserId, isTyping, typingUsername
           key={message.id}
           message={message}
           isSender={message.senderId === currentUserId}
+          displayText={(message as any).decryptedText ?? message.encryptedContent}
         />
       ))}
       {isTyping && typingUsername && (

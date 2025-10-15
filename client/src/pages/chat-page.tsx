@@ -62,28 +62,45 @@ export default function ChatPage() {
   useEffect(() => {
     const unsubMessage = ws.onMessage(async (message) => {
       const contactId = message.senderId === auth.user.id ? message.receiverId : message.senderId;
-      
-      setMessages(prev => ({
-        ...prev,
-        [contactId]: [...(prev[contactId] || []), message],
-      }));
 
-      if (message.senderId !== auth.user.id && message.encryptedAESKey) {
+      // Replace local temp message with server-acknowledged message to avoid duplicates
+      setMessages(prev => {
+        const currentList = prev[contactId] || [];
+        if (message.senderId === auth.user.id) {
+          const idx = currentList.findIndex(m =>
+            m.id.startsWith("temp-") &&
+            m.senderId === auth.user.id &&
+            m.receiverId === message.receiverId &&
+            m.hmac === message.hmac,
+          );
+          if (idx !== -1) {
+            const updatedList = [...currentList];
+            updatedList[idx] = message;
+            return { ...prev, [contactId]: updatedList };
+          }
+        }
+        return { ...prev, [contactId]: [...currentList, message] };
+      });
+
+      // Decrypt for both incoming and self-sent messages
+      const peerUserId = message.senderId === auth.user.id ? message.receiverId : message.senderId;
+      if (message.encryptedAESKey) {
         const decrypted = await decryptMessage(
           message.encryptedContent,
           message.iv,
           message.hmac,
           message.encryptedAESKey,
-          message.senderId
+          peerUserId,
         );
-        
+
         if (decrypted) {
           setDecryptedMessages(prev => ({
             ...prev,
             [message.id]: decrypted,
           }));
 
-          if (selectedContactId === message.senderId) {
+          // Mark as read only for incoming messages to the currently open chat
+          if (message.senderId !== auth.user.id && selectedContactId === peerUserId) {
             ws.markMessageAsRead(message.id, message.senderId);
           }
         }
@@ -156,7 +173,7 @@ export default function ChatPage() {
 
   const displayMessages = currentMessages.map(msg => ({
     ...msg,
-    encryptedContent: decryptedMessages[msg.id] || msg.encryptedContent,
+    decryptedText: decryptedMessages[msg.id] || msg.encryptedContent,
   }));
 
   const handleSelectContact = (contactId: string) => {
