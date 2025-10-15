@@ -6,9 +6,10 @@ import type { Message } from "@shared/schema";
 interface MessageBubbleProps {
   message: Message;
   isSender: boolean;
+  displayText?: string; // optional already-decrypted text to show
 }
 
-export function MessageBubble({ message, isSender }: MessageBubbleProps) {
+export function MessageBubble({ message, isSender, displayText }: MessageBubbleProps) {
   const getStatusIcon = () => {
     if (!isSender) return null;
     
@@ -40,7 +41,7 @@ export function MessageBubble({ message, isSender }: MessageBubbleProps) {
           )}
         >
           <p className="text-[0.9375rem] leading-relaxed whitespace-pre-wrap" data-testid={`text-message-${message.id}`}>
-            {message.encryptedContent}
+            {displayText ?? message.encryptedContent}
           </p>
         </div>
         <div

@@ -107,6 +107,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const messages = await storage.getMessages(currentUserId, userId);
+      // Opportunistically mark any 'sent' messages to current user as delivered
+      for (const m of messages) {
+        if (m.receiverId === currentUserId && m.status === 'sent') {
+          await storage.updateMessageStatus(m.id, 'delivered');
+        }
+      }
       res.json(messages);
     } catch (error: any) {
       res.status(500).json({ message: error.message });
@@ -130,12 +136,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
             ws.username = message.username;
             connectedClients.set(message.userId, ws);
             await storage.setOnlineStatus(message.userId, true);
-            
+
+            // Notify others this user is online
             broadcast({
               type: 'user-online',
               userId: message.userId,
               username: message.username,
             }, message.userId);
+
+            // Deliver any pending undelivered messages to this user
+            const pending = await storage.getUndeliveredMessagesFor(message.userId);
+            for (const pendingMsg of pending) {
+              ws.send(JSON.stringify({ type: 'message', message: pendingMsg }));
+              pendingMsg.status = 'delivered';
+              await storage.updateMessageStatus(pendingMsg.id, 'delivered');
+              // Notify sender about delivery
+              const senderWs = connectedClients.get(pendingMsg.senderId);
+              if (senderWs && senderWs.readyState === WebSocket.OPEN) {
+                senderWs.send(JSON.stringify({
+                  type: 'message-status',
+                  messageId: pendingMsg.id,
+                  status: 'delivered',
+                }));
+              }
+            }
             break;
 
           case 'typing':
@@ -186,6 +210,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 messageId: newMessage.id,
                 status: 'delivered',
               }));
+            } else {
+              // Recipient offline; keep as 'sent' to be delivered on next login
             }
             break;
 

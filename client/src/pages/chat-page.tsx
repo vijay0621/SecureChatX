@@ -10,6 +10,7 @@ import { useWebSocket } from "@/lib/websocket";
 import { getAuth } from "@/lib/auth";
 import { encryptMessage, decryptMessage } from "@/lib/chat-crypto";
 import { useToast } from "@/hooks/use-toast";
+import { writeLog } from "@/lib/utils";
 import type { ChatSession, Message } from "@shared/schema";
 
 interface UserWithStatus {
@@ -44,11 +45,11 @@ export default function ChatPage() {
   useEffect(() => {
     if (users) {
       const chatSessions: ChatSession[] = users
-        .filter(u => u.id !== auth.user.id && u.publicKey)
+        .filter(u => u.id !== auth.user.id)
         .map(u => ({
           userId: u.id,
           username: u.username,
-          publicKey: u.publicKey!,
+          publicKey: u.publicKey || "",
           lastMessage: undefined,
           lastMessageTime: undefined,
           unreadCount: 0,
@@ -56,34 +57,81 @@ export default function ChatPage() {
           lastSeen: u.lastSeen,
         }));
       setContacts(chatSessions);
+      // Persist usernames locally to keep showing even when offline
+      try {
+        localStorage.setItem("securechat-contacts", JSON.stringify(chatSessions.map(c => ({ userId: c.userId, username: c.username }))));
+      } catch {}
+    } else {
+      // Fallback from local cache if network/users unavailable
+      try {
+        const cached = localStorage.getItem("securechat-contacts");
+        if (cached) {
+          const list: { userId: string; username: string }[] = JSON.parse(cached);
+          setContacts(prev => {
+            const map = new Map(prev.map(c => [c.userId, c] as const));
+            list.forEach(({ userId, username }) => {
+              if (!map.has(userId)) {
+                map.set(userId, {
+                  userId,
+                  username,
+                  publicKey: "",
+                  unreadCount: 0,
+                  isOnline: false,
+                  lastSeen: Date.now(),
+                });
+              }
+            });
+            return Array.from(map.values());
+          });
+        }
+      } catch {}
     }
   }, [users, auth.user.id]);
 
   useEffect(() => {
     const unsubMessage = ws.onMessage(async (message) => {
+      writeLog("info", "ws.message", { id: message.id, from: message.senderId, to: message.receiverId });
       const contactId = message.senderId === auth.user.id ? message.receiverId : message.senderId;
-      
-      setMessages(prev => ({
-        ...prev,
-        [contactId]: [...(prev[contactId] || []), message],
-      }));
 
-      if (message.senderId !== auth.user.id && message.encryptedAESKey) {
+      // Replace local temp message with server-acknowledged message to avoid duplicates
+      setMessages(prev => {
+        const currentList = prev[contactId] || [];
+        if (message.senderId === auth.user.id) {
+          const idx = currentList.findIndex(m =>
+            m.id.startsWith("temp-") &&
+            m.senderId === auth.user.id &&
+            m.receiverId === message.receiverId &&
+            m.hmac === message.hmac,
+          );
+          if (idx !== -1) {
+            const updatedList = [...currentList];
+            updatedList[idx] = message;
+            return { ...prev, [contactId]: updatedList };
+          }
+        }
+        return { ...prev, [contactId]: [...currentList, message] };
+      });
+
+      // Decrypt for both incoming and self-sent messages
+      const peerUserId = message.senderId === auth.user.id ? message.receiverId : message.senderId;
+      if (message.encryptedAESKey) {
         const decrypted = await decryptMessage(
           message.encryptedContent,
           message.iv,
           message.hmac,
           message.encryptedAESKey,
-          message.senderId
+          peerUserId,
         );
-        
+
         if (decrypted) {
           setDecryptedMessages(prev => ({
             ...prev,
             [message.id]: decrypted,
           }));
+          writeLog("info", "message.decrypted", { id: message.id });
 
-          if (selectedContactId === message.senderId) {
+          // Mark as read only for incoming messages to the currently open chat
+          if (message.senderId !== auth.user.id && selectedContactId === peerUserId) {
             ws.markMessageAsRead(message.id, message.senderId);
           }
         }
@@ -156,8 +204,43 @@ export default function ChatPage() {
 
   const displayMessages = currentMessages.map(msg => ({
     ...msg,
-    encryptedContent: decryptedMessages[msg.id] || msg.encryptedContent,
+    decryptedText: decryptedMessages[msg.id] || msg.encryptedContent,
   }));
+
+  // Load full history when a contact is selected (ensures offline-sent messages appear)
+  useEffect(() => {
+    if (!selectedContactId) return;
+    (async () => {
+      try {
+        const res = await fetch(`/api/messages/${selectedContactId}`, {
+          headers: { 'x-user-id': auth.user.id },
+        });
+        if (!res.ok) return;
+        const remoteMessages: Message[] = await res.json();
+        setMessages(prev => {
+          const prevList = prev[selectedContactId] || [];
+          const merged = new Map<string, Message>();
+          for (const m of [...prevList, ...remoteMessages]) {
+            merged.set(m.id, m);
+          }
+          const list = Array.from(merged.values()).sort((a, b) => a.timestamp - b.timestamp);
+          return { ...prev, [selectedContactId]: list };
+        });
+        // Decrypt fetched messages
+        const decPairs = await Promise.all(remoteMessages.map(async (m) => {
+          const peerId = m.senderId === auth.user.id ? m.receiverId : m.senderId;
+          if (!m.encryptedAESKey) return [m.id, m.encryptedContent] as const;
+          const text = await decryptMessage(m.encryptedContent, m.iv, m.hmac, m.encryptedAESKey, peerId);
+          return [m.id, text || m.encryptedContent] as const;
+        }));
+        const decUpdates: { [k: string]: string } = {};
+        for (const [id, text] of decPairs) decUpdates[id] = text;
+        setDecryptedMessages(prev => ({ ...prev, ...decUpdates }));
+      } catch {
+        // ignore fetch failures silently
+      }
+    })();
+  }, [selectedContactId, auth.user.id]);
 
   const handleSelectContact = (contactId: string) => {
     setSelectedContactId(contactId);
@@ -180,6 +263,7 @@ export default function ChatPage() {
         selectedContact.publicKey,
         selectedContact.userId
       );
+      writeLog("info", "message.encrypt", { to: selectedContact.userId });
 
       ws.sendMessage(
         selectedContact.userId,
@@ -188,6 +272,7 @@ export default function ChatPage() {
         encrypted.hmac,
         encrypted.encryptedAESKey
       );
+      writeLog("info", "ws.send", { to: selectedContact.userId });
 
       const tempMessage: Message = {
         id: `temp-${Date.now()}`,
@@ -210,6 +295,7 @@ export default function ChatPage() {
         [tempMessage.id]: message,
       }));
     } catch (error) {
+      writeLog("error", "message.send_failed", {});
       toast({
         variant: "destructive",
         title: "Failed to send message",
