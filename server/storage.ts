@@ -12,6 +12,7 @@ export interface IStorage {
   storeMessage(message: Message): Promise<void>;
   getMessages(userId1: string, userId2: string): Promise<Message[]>;
   updateMessageStatus(messageId: string, status: 'delivered' | 'read'): Promise<void>;
+  getUndeliveredMessagesFor(userId: string): Promise<Message[]>;
   
   setOnlineStatus(userId: string, isOnline: boolean): Promise<void>;
   getOnlineStatus(userId: string): Promise<boolean>;
@@ -87,6 +88,12 @@ export class MemStorage implements IStorage {
           (msg.senderId === userId1 && msg.receiverId === userId2) ||
           (msg.senderId === userId2 && msg.receiverId === userId1)
       )
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  async getUndeliveredMessagesFor(userId: string): Promise<Message[]> {
+    return Array.from(this.messages.values())
+      .filter((msg) => msg.receiverId === userId && msg.status === 'sent')
       .sort((a, b) => a.timestamp - b.timestamp);
   }
 

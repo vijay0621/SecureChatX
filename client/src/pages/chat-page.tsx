@@ -10,6 +10,7 @@ import { useWebSocket } from "@/lib/websocket";
 import { getAuth } from "@/lib/auth";
 import { encryptMessage, decryptMessage } from "@/lib/chat-crypto";
 import { useToast } from "@/hooks/use-toast";
+import { writeLog } from "@/lib/utils";
 import type { ChatSession, Message } from "@shared/schema";
 
 interface UserWithStatus {
@@ -44,11 +45,11 @@ export default function ChatPage() {
   useEffect(() => {
     if (users) {
       const chatSessions: ChatSession[] = users
-        .filter(u => u.id !== auth.user.id && u.publicKey)
+        .filter(u => u.id !== auth.user.id)
         .map(u => ({
           userId: u.id,
           username: u.username,
-          publicKey: u.publicKey!,
+          publicKey: u.publicKey || "",
           lastMessage: undefined,
           lastMessageTime: undefined,
           unreadCount: 0,
@@ -56,11 +57,40 @@ export default function ChatPage() {
           lastSeen: u.lastSeen,
         }));
       setContacts(chatSessions);
+      // Persist usernames locally to keep showing even when offline
+      try {
+        localStorage.setItem("securechat-contacts", JSON.stringify(chatSessions.map(c => ({ userId: c.userId, username: c.username }))));
+      } catch {}
+    } else {
+      // Fallback from local cache if network/users unavailable
+      try {
+        const cached = localStorage.getItem("securechat-contacts");
+        if (cached) {
+          const list: { userId: string; username: string }[] = JSON.parse(cached);
+          setContacts(prev => {
+            const map = new Map(prev.map(c => [c.userId, c] as const));
+            list.forEach(({ userId, username }) => {
+              if (!map.has(userId)) {
+                map.set(userId, {
+                  userId,
+                  username,
+                  publicKey: "",
+                  unreadCount: 0,
+                  isOnline: false,
+                  lastSeen: Date.now(),
+                });
+              }
+            });
+            return Array.from(map.values());
+          });
+        }
+      } catch {}
     }
   }, [users, auth.user.id]);
 
   useEffect(() => {
     const unsubMessage = ws.onMessage(async (message) => {
+      writeLog("info", "ws.message", { id: message.id, from: message.senderId, to: message.receiverId });
       const contactId = message.senderId === auth.user.id ? message.receiverId : message.senderId;
 
       // Replace local temp message with server-acknowledged message to avoid duplicates
@@ -98,6 +128,7 @@ export default function ChatPage() {
             ...prev,
             [message.id]: decrypted,
           }));
+          writeLog("info", "message.decrypted", { id: message.id });
 
           // Mark as read only for incoming messages to the currently open chat
           if (message.senderId !== auth.user.id && selectedContactId === peerUserId) {
@@ -197,6 +228,7 @@ export default function ChatPage() {
         selectedContact.publicKey,
         selectedContact.userId
       );
+      writeLog("info", "message.encrypt", { to: selectedContact.userId });
 
       ws.sendMessage(
         selectedContact.userId,
@@ -205,6 +237,7 @@ export default function ChatPage() {
         encrypted.hmac,
         encrypted.encryptedAESKey
       );
+      writeLog("info", "ws.send", { to: selectedContact.userId });
 
       const tempMessage: Message = {
         id: `temp-${Date.now()}`,
@@ -227,6 +260,7 @@ export default function ChatPage() {
         [tempMessage.id]: message,
       }));
     } catch (error) {
+      writeLog("error", "message.send_failed", {});
       toast({
         variant: "destructive",
         title: "Failed to send message",
